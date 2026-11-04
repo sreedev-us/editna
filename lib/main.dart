@@ -184,7 +184,20 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   Future<void> _init() async {
     final prefs = await SharedPreferences.getInstance();
     _baseUrl = prefs.getString('baseUrl') ?? _baseUrl;
-    _model = prefs.getString('model') ?? 'auto';
+    if (Uri.tryParse(_baseUrl)?.host == 'integrate.api.nvidia.com') {
+      _baseUrl = 'https://integrate.api.nvidia.com/v1';
+      await prefs.setString('baseUrl', _baseUrl);
+    }
+    final savedModel = prefs.getString('model') ?? 'auto';
+    _model =
+        const {
+          'nvidia/mistral-nemo-12b-instruct': 'mistralai/mistral-nemotron',
+          'deepseek-ai/deepseek-r1': 'deepseek-ai/deepseek-v4-flash',
+          'qwen/qwen-2.5-7b-instruct': 'meta/llama-3.2-1b-instruct',
+          'meta/llama-3.1-405b-instruct': 'deepseek-ai/deepseek-v4-pro',
+        }[savedModel] ??
+        savedModel;
+    if (_model != savedModel) await prefs.setString('model', _model);
     _plannerPath = prefs.getString('local_planner_path');
     _routerPath = prefs.getString('local_router_path');
     _githubRepoUrl = prefs.getString('github_repo_url') ?? '';
@@ -559,10 +572,10 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         }
         final tag = result.toString().trim().toUpperCase();
         const routes = {
-          'HEAVY_REASONING': 'meta/llama-3.1-405b-instruct',
-          'ALGORITHM_DEBUG': 'deepseek-ai/deepseek-r1',
-          'STANDARD_EDIT': 'nvidia/mistral-nemo-12b-instruct',
-          'FAST_INLINE_FIX': 'qwen/qwen-2.5-7b-instruct',
+          'HEAVY_REASONING': 'deepseek-ai/deepseek-v4-pro',
+          'ALGORITHM_DEBUG': 'deepseek-ai/deepseek-v4-flash',
+          'STANDARD_EDIT': 'mistralai/mistral-nemotron',
+          'FAST_INLINE_FIX': 'meta/llama-3.2-1b-instruct',
         };
         final model = routes[tag];
         if (model != null) {
@@ -581,20 +594,20 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       r'\b(prove|architecture|design a system|deep reasoning|tradeoffs)\b',
     ).hasMatch(p)) {
       bucket = 'HEAVY_REASONING';
-      model = 'meta/llama-3.1-405b-instruct';
+      model = 'deepseek-ai/deepseek-v4-pro';
     } else if (RegExp(
       r'\b(algorithm|complexity|optimi[sz]e|debug|crash|exception|race condition|memory leak)\b',
     ).hasMatch(p)) {
       bucket = 'ALGORITHM_DEBUG';
-      model = 'deepseek-ai/deepseek-r1';
+      model = 'deepseek-ai/deepseek-v4-flash';
     } else if (RegExp(
       r'\b(fix typo|quick fix|inline|rename symbol|one-line)\b',
     ).hasMatch(p)) {
       bucket = 'FAST_INLINE_FIX';
-      model = 'qwen/qwen-2.5-7b-instruct';
+      model = 'meta/llama-3.2-1b-instruct';
     } else {
       bucket = 'STANDARD_EDIT';
-      model = 'nvidia/mistral-nemo-12b-instruct';
+      model = 'mistralai/mistral-nemotron';
     }
     watch.stop();
     _routerInfo =
@@ -898,7 +911,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         if (res.statusCode < 200 || res.statusCode >= 300) {
           final body = await utf8.decoder.bind(res).join();
           throw Exception(
-            'Provider returned ${res.statusCode}: ${body.length > 240 ? body.substring(0, 240) : body}',
+            'Provider returned ${res.statusCode} for $model at $uri. Check Settings → Base URL (use https://integrate.api.nvidia.com/v1) and verify the selected model is available. ${body.length > 180 ? body.substring(0, 180) : body}',
           );
         }
         await for (final line
@@ -1574,20 +1587,20 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                         child: Text('Automatic routing'),
                       ),
                       DropdownMenuItem(
-                        value: 'nvidia/mistral-nemo-12b-instruct',
-                        child: Text('Mistral NeMo 12B'),
+                        value: 'mistralai/mistral-nemotron',
+                        child: Text('Mistral Nemotron'),
                       ),
                       DropdownMenuItem(
-                        value: 'deepseek-ai/deepseek-r1',
-                        child: Text('DeepSeek R1'),
+                        value: 'deepseek-ai/deepseek-v4-flash',
+                        child: Text('DeepSeek V4 Flash'),
                       ),
                       DropdownMenuItem(
-                        value: 'qwen/qwen-2.5-7b-instruct',
-                        child: Text('Qwen Coder 7B'),
+                        value: 'meta/llama-3.2-1b-instruct',
+                        child: Text('Llama 3.2 1B'),
                       ),
                       DropdownMenuItem(
-                        value: 'meta/llama-3.1-405b-instruct',
-                        child: Text('Llama 3.1 405B'),
+                        value: 'deepseek-ai/deepseek-v4-pro',
+                        child: Text('DeepSeek V4 Pro'),
                       ),
                     ],
                     onChanged: (v) => setLocal(() => selected = v ?? 'auto'),
