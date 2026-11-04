@@ -38,6 +38,7 @@ dependencies:
   shared_preferences: ^2.5.5
   file_picker: ^13.3.2
   flutter_secure_storage: ^11.2.0
+  llamadart: 0.17.5
 
 dev_dependencies:
   flutter_test:
