@@ -6,9 +6,13 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:crypto/crypto.dart';
 import 'package:llamadart/llamadart.dart';
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 const ink = Color(0xff101214),
     panel = Color(0xff171a1b),
@@ -16,7 +20,68 @@ const ink = Color(0xff101214),
     line = Color(0xff292e2b),
     lime = Color(0xffc7f184),
     quiet = Color(0xff929991);
-void main() => runApp(const ForgeApp());
+const _supabaseRedirect = 'http://127.0.0.1:54321/auth/callback';
+const _buildSupabaseUrl = String.fromEnvironment('SUPABASE_URL');
+const _buildSupabaseKey = String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY');
+bool _supabaseReady = false;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  const secure = FlutterSecureStorage();
+  final url =
+      await secure.read(key: 'supabase_project_url') ?? _buildSupabaseUrl;
+  final key =
+      await secure.read(key: 'supabase_publishable_key') ?? _buildSupabaseKey;
+  if (url.isNotEmpty && key.isNotEmpty) {
+    try {
+      await secure.write(key: 'supabase_project_url', value: url);
+      await secure.write(key: 'supabase_publishable_key', value: key);
+      await Supabase.initialize(
+        url: url,
+        publishableKey: key,
+        authOptions: FlutterAuthClientOptions(
+          authFlowType: AuthFlowType.pkce,
+          localStorage: _SecureSupabaseSessionStorage(secure),
+        ),
+      );
+      _supabaseReady = true;
+    } catch (_) {
+      // Keep local editing available if cloud configuration is invalid/offline.
+    }
+  }
+  runApp(const ForgeApp());
+}
+
+class _SecureSupabaseSessionStorage extends LocalStorage {
+  const _SecureSupabaseSessionStorage(this.storage);
+  final FlutterSecureStorage storage;
+  static const _key = 'supabase_auth_session';
+
+  @override
+  Future<void> initialize() async {}
+
+  @override
+  Future<bool> hasAccessToken() async => (await accessToken()) != null;
+
+  @override
+  Future<String?> accessToken() async {
+    final value = await storage.read(key: _key);
+    if (value == null) return null;
+    try {
+      return (jsonDecode(value) as Map<String, dynamic>)['access_token']
+          as String?;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Future<void> removePersistedSession() => storage.delete(key: _key);
+
+  @override
+  Future<void> persistSession(String persistSessionString) =>
+      storage.write(key: _key, value: persistSessionString);
+}
 
 class ForgeApp extends StatelessWidget {
   const ForgeApp({super.key});
@@ -75,9 +140,17 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       _model = 'auto';
   String? _apiKey;
   LlamaEngine? _plannerEngine;
+  LlamaEngine? _routerEngine;
   String? _plannerPath;
+  String? _routerPath;
   String _telemetry = 'No cloud requests yet';
   String _routerInfo = '';
+  String _supabaseUrl = 'https://ngddikhxsoorjubfxwjt.supabase.co';
+  String? _supabasePublishableKey;
+  String _githubRepoUrl = '';
+  String _syncInfo = 'Cloud sync is off';
+  bool _syncing = false;
+  RealtimeChannel? _syncChannel;
   double? _modelDownloadProgress;
   bool _busy = false,
       _dirty = false,
@@ -85,6 +158,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       _mobileAssistantOpen = false;
   String _busyLabel = 'Waiting for model…';
   Timer? _saveTimer;
+  Timer? _syncTimer;
   @override
   void initState() {
     super.initState();
@@ -94,8 +168,12 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   @override
   void dispose() {
     _saveTimer?.cancel();
+    _syncTimer?.cancel();
+    unawaited(_syncChannel?.unsubscribe() ?? Future<void>.value());
     final engine = _plannerEngine;
     if (engine != null) unawaited(engine.dispose());
+    final router = _routerEngine;
+    if (router != null) unawaited(router.dispose());
     _editor.dispose();
     _editorScroll.dispose();
     _prompt.dispose();
@@ -108,6 +186,43 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     _baseUrl = prefs.getString('baseUrl') ?? _baseUrl;
     _model = prefs.getString('model') ?? 'auto';
     _plannerPath = prefs.getString('local_planner_path');
+    _routerPath = prefs.getString('local_router_path');
+    _githubRepoUrl = prefs.getString('github_repo_url') ?? '';
+    _supabaseUrl =
+        await _storage.read(key: 'supabase_project_url') ?? _supabaseUrl;
+    _supabasePublishableKey = await _storage.read(
+      key: 'supabase_publishable_key',
+    );
+    if (_supabaseReady) {
+      _syncInfo = _cloud.auth.currentUser == null
+          ? 'Supabase ready • sign in to sync'
+          : 'Signed in as ${_cloud.auth.currentUser?.email ?? _cloud.auth.currentUser?.id}';
+    }
+    final modelDirectory = Directory('model');
+    if (await modelDirectory.exists()) {
+      _plannerPath ??=
+          (await File(
+            '${modelDirectory.path}${Platform.pathSeparator}${Platform.isWindows ? 'qwen2.5-3b-instruct-q4_k_m.gguf' : 'qwen2.5-1.5b-instruct-q4_k_m.gguf'}',
+          ).exists())
+          ? '${modelDirectory.path}${Platform.pathSeparator}${Platform.isWindows ? 'qwen2.5-3b-instruct-q4_k_m.gguf' : 'qwen2.5-1.5b-instruct-q4_k_m.gguf'}'
+          : null;
+      _routerPath ??=
+          (await File(
+            '${modelDirectory.path}${Platform.pathSeparator}qwen2.5-0.5b-instruct-q4_k_m.gguf',
+          ).exists())
+          ? '${modelDirectory.path}${Platform.pathSeparator}qwen2.5-0.5b-instruct-q4_k_m.gguf'
+          : null;
+      if (_plannerPath != null) {
+        _plannerPath = File(_plannerPath!).absolute.path;
+      }
+      if (_routerPath != null) _routerPath = File(_routerPath!).absolute.path;
+      if (_plannerPath != null) {
+        await prefs.setString('local_planner_path', _plannerPath!);
+      }
+      if (_routerPath != null) {
+        await prefs.setString('local_router_path', _routerPath!);
+      }
+    }
     _apiKey = await _storage.read(key: 'provider_api_key');
     final docs = await getApplicationDocumentsDirectory();
     _workspace = Directory(
@@ -260,6 +375,13 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       _recentEdits.remove(_activeFile);
       _recentEdits.insert(0, _activeFile!);
       if (_recentEdits.length > 5) _recentEdits.removeLast();
+      if (_supabaseReady && _cloud.auth.currentUser != null) {
+        _syncTimer?.cancel();
+        _syncTimer = Timer(
+          const Duration(seconds: 2),
+          () => unawaited(_syncWorkspace()),
+        );
+      }
       if (mounted) {
         setState(() {
           _dirty = false;
@@ -406,13 +528,53 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
   }
 
-  String _route(String prompt) {
+  Future<String> _route(String prompt) async {
     final watch = Stopwatch()..start();
     if (_model != 'auto') {
       _routerInfo = 'Manual model • instant';
       return _model;
     }
     final p = prompt.toLowerCase();
+    final routerPath = _routerPath;
+    if (routerPath != null && await File(routerPath).exists()) {
+      try {
+        _routerEngine ??= await LlamaEngine.load(
+          LlamaModel(ModelSource.path(routerPath)),
+          params: const ModelParams(contextSize: 512),
+        );
+        final result = StringBuffer();
+        await for (final chunk in _routerEngine!.create(
+          [
+            const LlamaChatMessage(
+              role: 'system',
+              content:
+                  'Classify the user prompt as exactly one tag: HEAVY_REASONING, ALGORITHM_DEBUG, STANDARD_EDIT, FAST_INLINE_FIX. Output only that tag.',
+            ),
+            LlamaChatMessage(role: 'user', content: prompt),
+          ],
+          params: const GenerationParams(maxTokens: 8, temp: 0),
+          enableThinking: false,
+        )) {
+          result.write(chunk.text);
+        }
+        final tag = result.toString().trim().toUpperCase();
+        const routes = {
+          'HEAVY_REASONING': 'meta/llama-3.1-405b-instruct',
+          'ALGORITHM_DEBUG': 'deepseek-ai/deepseek-r1',
+          'STANDARD_EDIT': 'nvidia/mistral-nemo-12b-instruct',
+          'FAST_INLINE_FIX': 'qwen/qwen-2.5-7b-instruct',
+        };
+        final model = routes[tag];
+        if (model != null) {
+          watch.stop();
+          _routerInfo =
+              '$tag • ${(watch.elapsedMicroseconds / 1000).toStringAsFixed(1)} ms (local)';
+          return model;
+        }
+      } catch (_) {
+        // Use the built-in rule router if an optional local model cannot run.
+      }
+    }
     late final String model;
     late final String bucket;
     if (RegExp(
@@ -496,6 +658,33 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     } finally {
       client.close(force: true);
     }
+  }
+
+  Future<void> _chooseModel({required bool router}) async {
+    final result = await FilePicker.pickFile(
+      type: FileType.custom,
+      allowedExtensions: const ['gguf'],
+      dialogTitle: router
+          ? 'Choose the Qwen router GGUF'
+          : 'Choose the local planner GGUF',
+    );
+    final path = result?.path;
+    if (path == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    if (router) {
+      final old = _routerEngine;
+      _routerEngine = null;
+      if (old != null) await old.dispose();
+      _routerPath = path;
+      await prefs.setString('local_router_path', path);
+    } else {
+      final old = _plannerEngine;
+      _plannerEngine = null;
+      if (old != null) await old.dispose();
+      _plannerPath = path;
+      await prefs.setString('local_planner_path', path);
+    }
+    if (mounted) setState(() {});
   }
 
   Future<String?> _localPlan(Map<String, Object?> map, String request) async {
@@ -750,12 +939,18 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     final text = (suggested ?? _prompt.text).trim();
     if (text.isEmpty || _busy) return;
     FocusScope.of(context).unfocus();
-    final route = _route(text);
+    setState(() {
+      _busy = true;
+      _busyLabel = _routerPath == null
+          ? 'Routing request locally…'
+          : 'Classifying request on-device…';
+      _prompt.clear();
+    });
+    final route = await _route(text);
+    if (!mounted) return;
     setState(() {
       _messages.add(_ChatMessage(text, true, route));
-      _busy = true;
       _busyLabel = 'Mapping project and planning…';
-      _prompt.clear();
     });
     _scrollChat();
     try {
@@ -797,6 +992,25 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       }
       if (!mounted) return;
       final plan = _parsePlan(plannerOutput.toString(), text, route);
+      if (_supabaseReady && _cloud.auth.currentUser != null) {
+        try {
+          final projectId = await _ensureCloudProject();
+          final row = await _cloud
+              .from('ai_sessions')
+              .insert({
+                'project_id': projectId,
+                'assigned_cloud_model': route,
+                'generated_plan': plan.steps,
+                'requested_files': plan.requestedFiles,
+                'status': 'planned',
+              })
+              .select('id')
+              .single();
+          plan.cloudSessionId = row['id'] as String;
+        } catch (e) {
+          _syncInfo = 'Plan saved locally; cloud metadata: $e';
+        }
+      }
       setState(
         () => _messages.add(
           _ChatMessage(
@@ -897,6 +1111,16 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
           _ChatMessage('No response text returned.', false, plan.model),
         );
       }
+      if (_supabaseReady && plan.cloudSessionId != null) {
+        try {
+          await _cloud
+              .from('ai_sessions')
+              .update({'status': 'completed'})
+              .eq('id', plan.cloudSessionId!);
+        } catch (_) {
+          // Cloud metadata failure does not invalidate the completed response.
+        }
+      }
     } catch (e) {
       if (!mounted) return;
       plan.executed = false;
@@ -931,9 +1155,314 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     });
   }
 
+  SupabaseClient get _cloud => Supabase.instance.client;
+
+  Future<void> _signInWithGithub() async {
+    if (!_supabaseReady) {
+      throw Exception(
+        'Save valid Supabase URL and publishable key in Settings first.',
+      );
+    }
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 54321);
+    final client = _cloud;
+    try {
+      final oauth = await client.auth.getOAuthSignInUrl(
+        provider: OAuthProvider.github,
+        redirectTo: _supabaseRedirect,
+        scopes: 'repo user',
+      );
+      if (!await launchUrl(
+        Uri.parse(oauth.url),
+        mode: LaunchMode.externalApplication,
+      )) {
+        throw Exception(
+          'Could not open the system browser for GitHub sign-in.',
+        );
+      }
+      final completer = Completer<String>();
+      final subscription = server.listen((request) async {
+        final code = request.uri.queryParameters['code'];
+        request.response.headers.contentType = ContentType.html;
+        request.response.write(
+          '<html><body>Forge sign-in complete. You can return to the app.</body></html>',
+        );
+        await request.response.close();
+        if (code != null && !completer.isCompleted) completer.complete(code);
+      });
+      final code = await completer.future.timeout(const Duration(minutes: 5));
+      await client.auth.exchangeCodeForSession(code);
+      final githubToken = client.auth.currentSession?.providerToken;
+      if (githubToken != null && githubToken.isNotEmpty) {
+        await _storage.write(key: 'github_access_token', value: githubToken);
+      }
+      await subscription.cancel();
+      if (mounted) {
+        setState(
+          () => _syncInfo =
+              'Signed in as ${client.auth.currentUser?.email ?? client.auth.currentUser?.id}',
+        );
+      }
+    } finally {
+      await server.close(force: true);
+    }
+  }
+
+  Future<String> _ensureCloudProject() async {
+    final client = _cloud;
+    final user = client.auth.currentUser;
+    if (user == null) throw Exception('Sign in with GitHub before syncing.');
+    final prefs = await SharedPreferences.getInstance();
+    var id = prefs.getString('cloud_project_id');
+    if (id == null) {
+      final row = await client
+          .from('projects')
+          .insert({
+            'user_id': user.id,
+            'name': 'Forge workspace',
+            if (_githubRepoUrl.isNotEmpty) 'github_repo_url': _githubRepoUrl,
+          })
+          .select('id')
+          .single();
+      id = row['id'] as String;
+      await prefs.setString('cloud_project_id', id);
+    } else {
+      await client.from('projects').upsert({
+        'id': id,
+        'user_id': user.id,
+        'name': 'Forge workspace',
+        'github_repo_url': _githubRepoUrl.isEmpty ? null : _githubRepoUrl,
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      });
+    }
+    _syncChannel ??=
+        client
+            .channel('forge-project-$id')
+            .onPostgresChanges(
+              event: PostgresChangeEvent.all,
+              schema: 'public',
+              table: 'project_files',
+              filter: PostgresChangeFilter(
+                type: PostgresChangeFilterType.eq,
+                column: 'project_id',
+                value: id,
+              ),
+              callback: (_) => unawaited(_syncWorkspace()),
+            )
+          ..subscribe();
+    return id;
+  }
+
+  Future<void> _syncWorkspace() async {
+    if (!_supabaseReady || _syncing) return;
+    setState(() {
+      _syncing = true;
+      _syncInfo = 'Syncing project files…';
+    });
+    try {
+      final client = _cloud;
+      final userId = client.auth.currentUser?.id;
+      if (userId == null) {
+        throw Exception('Sign in with GitHub in Settings before syncing.');
+      }
+      final projectId = await _ensureCloudProject();
+      final remoteRows = await client
+          .from('project_files')
+          .select('file_path, content_hash, storage_path')
+          .eq('project_id', projectId);
+      final remote = <String, Map<String, dynamic>>{};
+      for (final row in (remoteRows as List).cast<Map<String, dynamic>>()) {
+        final rawPath = row['file_path'] as String?;
+        final safePath = rawPath == null ? null : _safeRelativePath(rawPath);
+        if (safePath != null && safePath == rawPath) remote[safePath] = row;
+      }
+      final prefs = await SharedPreferences.getInstance();
+      final baselineKey = 'sync_baseline_$projectId';
+      final baseline =
+          jsonDecode(prefs.getString(baselineKey) ?? '{}')
+              as Map<String, dynamic>;
+      var conflicts = 0;
+      for (final path in List<String>.of(_files)) {
+        final file = _file(path);
+        if (!await file.exists()) continue;
+        final bytes = await file.readAsBytes();
+        final localHash = sha256.convert(bytes).toString();
+        final record = remote[path];
+        final remoteHash = record?['content_hash'] as String?;
+        final baseHash = baseline[path] as String?;
+        final storagePath = '$userId/$projectId/$path';
+        if (remoteHash == localHash) {
+          baseline[path] = localHash;
+          continue;
+        }
+        if (remoteHash != null && localHash == baseHash) {
+          final remoteBytes = await client.storage
+              .from('project-files')
+              .download(storagePath);
+          await file.writeAsBytes(remoteBytes, flush: true);
+          baseline[path] = remoteHash;
+          continue;
+        }
+        if (remoteHash != null &&
+            remoteHash != localHash &&
+            (baseHash == null || remoteHash != baseHash)) {
+          conflicts++;
+          continue;
+        }
+        await client.storage
+            .from('project-files')
+            .uploadBinary(
+              storagePath,
+              bytes,
+              fileOptions: const FileOptions(
+                upsert: true,
+                contentType: 'application/octet-stream',
+              ),
+            );
+        await client.from('project_files').upsert({
+          'project_id': projectId,
+          'file_path': path,
+          'content_hash': localHash,
+          'storage_path': storagePath,
+          'updated_at': DateTime.now().toUtc().toIso8601String(),
+        }, onConflict: 'project_id,file_path');
+        baseline[path] = localHash;
+      }
+      for (final entry in remote.entries) {
+        if (_files.contains(entry.key)) continue;
+        final hash = entry.value['content_hash'] as String;
+        final storagePath = entry.value['storage_path'] as String;
+        final bytes = await client.storage
+            .from('project-files')
+            .download(storagePath);
+        final destination = _file(entry.key);
+        await destination.parent.create(recursive: true);
+        await destination.writeAsBytes(bytes, flush: true);
+        if (sha256.convert(bytes).toString() == hash) {
+          baseline[entry.key] = hash;
+        }
+      }
+      await prefs.setString(baselineKey, jsonEncode(baseline));
+      await _scan();
+      if (mounted) {
+        setState(
+          () => _syncInfo = conflicts == 0
+              ? 'Sync complete'
+              : 'Sync complete • $conflicts conflict(s) skipped',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _syncInfo = e.toString().replaceFirst('Exception: ', ''),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _syncing = false);
+    }
+  }
+
+  Future<void> _pushGithub() async {
+    final sessionToken = _supabaseReady
+        ? _cloud.auth.currentSession?.providerToken
+        : null;
+    final token =
+        sessionToken ?? await _storage.read(key: 'github_access_token');
+    if (token == null || token.isEmpty) {
+      throw Exception(
+        'Sign in with GitHub in Settings to authorize repository writes.',
+      );
+    }
+    final raw = _githubRepoUrl.trim().replaceFirst(RegExp(r'\.git$'), '');
+    final match = RegExp(
+      r'(?:github\.com[:/])([^/]+)/([^/]+)$',
+    ).firstMatch(raw);
+    if (match == null) {
+      throw Exception('Enter a GitHub repository URL in Settings.');
+    }
+    final owner = match.group(1)!;
+    final repo = match.group(2)!;
+    final repoPath =
+        '/repos/${Uri.encodeComponent(owner)}/${Uri.encodeComponent(repo)}';
+    final http = HttpClient();
+    Future<Map<String, dynamic>> request(
+      String method,
+      Uri uri, [
+      Map<String, Object?>? body,
+    ]) async {
+      final req = await http.openUrl(method, uri);
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set(HttpHeaders.acceptHeader, 'application/vnd.github+json');
+      req.headers.set(HttpHeaders.userAgentHeader, 'Forge-Editor');
+      req.headers.set('X-GitHub-Api-Version', '2022-11-28');
+      if (body != null) {
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode(body));
+      }
+      final res = await req.close();
+      final text = await utf8.decoder.bind(res).join();
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throw Exception(
+          'GitHub API ${res.statusCode}: ${text.length > 200 ? text.substring(0, 200) : text}',
+        );
+      }
+      return text.isEmpty ? {} : jsonDecode(text) as Map<String, dynamic>;
+    }
+
+    try {
+      final repository = await request(
+        'GET',
+        Uri.parse('https://api.github.com$repoPath'),
+      );
+      final branch = repository['default_branch'] as String;
+      var count = 0;
+      for (final path in _files) {
+        final file = _file(path);
+        if (!await file.exists()) continue;
+        final encodedPath = path.split('/').map(Uri.encodeComponent).join('/');
+        final contentsPath = '$repoPath/contents/$encodedPath';
+        String? sha;
+        final bytes = await file.readAsBytes();
+        try {
+          final current = await request(
+            'GET',
+            Uri.parse(
+              'https://api.github.com$contentsPath?ref=${Uri.encodeQueryComponent(branch)}',
+            ),
+          );
+          sha = current['sha'] as String?;
+          final currentContent = current['content'] as String?;
+          if (currentContent != null &&
+              listEquals(
+                base64Decode(currentContent.replaceAll(RegExp(r'\s'), '')),
+                bytes,
+              )) {
+            continue;
+          }
+        } on Exception catch (e) {
+          if (!e.toString().contains('404')) rethrow;
+        }
+        await request('PUT', Uri.parse('https://api.github.com$contentsPath'), {
+          'message': 'Update $path via Forge',
+          'content': base64Encode(bytes),
+          'branch': branch,
+          'sha': ?sha,
+        });
+        count++;
+      }
+      if (mounted) _snack('Pushed $count file(s) to $owner/$repo.');
+    } finally {
+      http.close(force: true);
+    }
+  }
+
   Future<void> _settings() async {
     final url = TextEditingController(text: _baseUrl),
-        key = TextEditingController(text: _apiKey ?? '');
+        key = TextEditingController(text: _apiKey ?? ''),
+        supabaseUrl = TextEditingController(text: _supabaseUrl),
+        supabaseKey = TextEditingController(
+          text: _supabasePublishableKey ?? '',
+        ),
+        githubRepo = TextEditingController(text: _githubRepoUrl);
     var selected = _model;
     final result = await showDialog<bool>(
       context: context,
@@ -943,33 +1472,61 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
           title: const Text('AI provider'),
           content: SizedBox(
             width: 420,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'OpenAI-compatible API',
-                  style: TextStyle(color: quiet, fontSize: 12),
-                ),
-                const SizedBox(height: 14),
-                TextField(
-                  controller: url,
-                  decoration: const InputDecoration(
-                    labelText: 'Base URL',
-                    hintText: 'https://integrate.api.nvidia.com/v1',
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'OpenAI-compatible API',
+                    style: TextStyle(color: quiet, fontSize: 12),
                   ),
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        _plannerPath == null
-                            ? 'Offline Pass 1 planner: not installed (about 1.12 GB)'
-                            : 'Offline Pass 1 planner: installed',
-                        style: const TextStyle(color: quiet, fontSize: 11),
-                      ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: url,
+                    decoration: const InputDecoration(
+                      labelText: 'Base URL',
+                      hintText: 'https://integrate.api.nvidia.com/v1',
                     ),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Pass 1 planner: ${_plannerPath?.split(Platform.pathSeparator).last ?? 'not selected'}',
+                          style: const TextStyle(color: quiet, fontSize: 11),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () async {
+                          await _chooseModel(router: false);
+                          setLocal(() {});
+                        },
+                        child: const Text('Choose GGUF'),
+                      ),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Intent router: ${_routerPath?.split(Platform.pathSeparator).last ?? 'rules fallback'}',
+                          style: const TextStyle(color: quiet, fontSize: 11),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () async {
+                          await _chooseModel(router: true);
+                          setLocal(() {});
+                        },
+                        child: const Text('Choose GGUF'),
+                      ),
+                    ],
+                  ),
+                  if (_plannerPath == null)
                     TextButton(
                       onPressed: _modelDownloadProgress != null
                           ? null
@@ -981,68 +1538,179 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                                 if (!mounted) return;
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(
-                                    content: Text('Planner install failed: $e'),
+                                    content: Text(
+                                      'Planner download failed: $e',
+                                    ),
                                   ),
                                 );
                               }
                             },
                       child: Text(
                         _modelDownloadProgress == null
-                            ? (_plannerPath == null ? 'Download' : 'Ready')
-                            : '${((_modelDownloadProgress ?? 0) * 100).toStringAsFixed(0)}%',
+                            ? 'Download Qwen 1.5B instead'
+                            : 'Downloading ${((_modelDownloadProgress ?? 0) * 100).toStringAsFixed(0)}%',
                       ),
                     ),
-                  ],
-                ),
-                if (_modelDownloadProgress != null)
-                  LinearProgressIndicator(value: _modelDownloadProgress),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: key,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: 'API key',
-                    hintText: 'Stored securely on this device',
+                  if (_modelDownloadProgress != null)
+                    LinearProgressIndicator(value: _modelDownloadProgress),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: key,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: 'API key',
+                      hintText: 'Stored securely on this device',
+                    ),
                   ),
-                ),
-                const SizedBox(height: 12),
-                DropdownButtonFormField<String>(
-                  initialValue: selected,
-                  decoration: const InputDecoration(labelText: 'Model routing'),
-                  items: const [
-                    DropdownMenuItem(
-                      value: 'auto',
-                      child: Text('Automatic routing'),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    initialValue: selected,
+                    decoration: const InputDecoration(
+                      labelText: 'Model routing',
                     ),
-                    DropdownMenuItem(
-                      value: 'nvidia/mistral-nemo-12b-instruct',
-                      child: Text('Mistral NeMo 12B'),
-                    ),
-                    DropdownMenuItem(
-                      value: 'deepseek-ai/deepseek-r1',
-                      child: Text('DeepSeek R1'),
-                    ),
-                    DropdownMenuItem(
-                      value: 'qwen/qwen-2.5-7b-instruct',
-                      child: Text('Qwen Coder 7B'),
-                    ),
-                    DropdownMenuItem(
-                      value: 'meta/llama-3.1-405b-instruct',
-                      child: Text('Llama 3.1 405B'),
-                    ),
-                  ],
-                  onChanged: (v) => setLocal(() => selected = v ?? 'auto'),
-                ),
-                const SizedBox(height: 10),
-                Text(
-                  '$_routerInfo\nThe local GGUF runs on-device through llama.cpp. Cloud Pass 2 requests go directly to your provider. $_telemetry',
-                  style: const TextStyle(
-                    color: quiet,
-                    fontSize: 11,
-                    height: 1.4,
+                    items: const [
+                      DropdownMenuItem(
+                        value: 'auto',
+                        child: Text('Automatic routing'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'nvidia/mistral-nemo-12b-instruct',
+                        child: Text('Mistral NeMo 12B'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'deepseek-ai/deepseek-r1',
+                        child: Text('DeepSeek R1'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'qwen/qwen-2.5-7b-instruct',
+                        child: Text('Qwen Coder 7B'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'meta/llama-3.1-405b-instruct',
+                        child: Text('Llama 3.1 405B'),
+                      ),
+                    ],
+                    onChanged: (v) => setLocal(() => selected = v ?? 'auto'),
                   ),
-                ),
-              ],
+                  const SizedBox(height: 10),
+                  Text(
+                    '$_routerInfo\nThe local GGUF runs on-device through llama.cpp. Cloud Pass 2 requests go directly to your provider. $_telemetry',
+                    style: const TextStyle(
+                      color: quiet,
+                      fontSize: 11,
+                      height: 1.4,
+                    ),
+                  ),
+                  const Divider(height: 24),
+                  const Text(
+                    'SUPABASE & GITHUB',
+                    style: TextStyle(
+                      color: lime,
+                      fontSize: 11,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: supabaseUrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Supabase project URL',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: supabaseKey,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Supabase publishable / anon key',
+                      hintText: 'Stored in device secure storage',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: githubRepo,
+                    decoration: const InputDecoration(
+                      labelText: 'GitHub repository URL',
+                      hintText: 'https://github.com/owner/repository',
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      _syncInfo,
+                      style: const TextStyle(color: quiet, fontSize: 11),
+                    ),
+                  ),
+                  Wrap(
+                    spacing: 6,
+                    children: [
+                      TextButton(
+                        onPressed: !_supabaseReady
+                            ? null
+                            : () async {
+                                try {
+                                  await _signInWithGithub();
+                                  setLocal(() {});
+                                } catch (e) {
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(
+                                        'GitHub sign-in failed: $e',
+                                      ),
+                                    ),
+                                  );
+                                }
+                              },
+                        child: Text(
+                          _supabaseReady && _cloud.auth.currentUser != null
+                              ? 'Signed in'
+                              : 'Sign in with GitHub',
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: !_supabaseReady || _syncing
+                            ? null
+                            : () => _syncWorkspace(),
+                        child: Text(_syncing ? 'Syncing…' : 'Sync now'),
+                      ),
+                      TextButton(
+                        onPressed: !_supabaseReady
+                            ? null
+                            : () async {
+                                try {
+                                  await _pushGithub();
+                                } catch (e) {
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('GitHub push failed: $e'),
+                                    ),
+                                  );
+                                }
+                              },
+                        child: const Text('Commit & Push'),
+                      ),
+                      if (_supabaseReady && _cloud.auth.currentUser != null)
+                        TextButton(
+                          onPressed: () async {
+                            await _cloud.auth.signOut();
+                            await _storage.delete(key: 'github_access_token');
+                            if (mounted) {
+                              setState(() => _syncInfo = 'Signed out');
+                            }
+                            setLocal(() {});
+                          },
+                          child: const Text('Sign out'),
+                        ),
+                    ],
+                  ),
+                  const Text(
+                    'GitHub OAuth credentials belong in Supabase Dashboard. Add http://127.0.0.1:54321/auth/callback to Supabase Auth redirect URLs.',
+                    style: TextStyle(color: quiet, fontSize: 10, height: 1.35),
+                  ),
+                ],
+              ),
             ),
           ),
           actions: [
@@ -1064,6 +1732,15 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       _model = selected;
       await prefs.setString('baseUrl', _baseUrl);
       await prefs.setString('model', _model);
+      try {
+        await _saveCloudSettings(
+          supabaseUrl.text,
+          supabaseKey.text,
+          githubRepo.text,
+        );
+      } catch (e) {
+        _snack(e.toString().replaceFirst('Bad state: ', ''));
+      }
       if (key.text.trim().isEmpty) {
         await _storage.delete(key: 'provider_api_key');
         _apiKey = null;
@@ -1073,6 +1750,70 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       }
       if (mounted) setState(() {});
     }
+  }
+
+  Future<void> _saveCloudSettings(
+    String url,
+    String publishableKey,
+    String repo,
+  ) async {
+    final cleanUrl = url.trim();
+    final cleanKey = publishableKey.trim();
+    if (!cleanUrl.startsWith('https://') || cleanKey.isEmpty) {
+      throw Exception('Enter the Supabase project URL and publishable key.');
+    }
+    final previousUrl = _supabaseUrl;
+    final previousKey = _supabasePublishableKey;
+    await _storage.write(key: 'supabase_project_url', value: cleanUrl);
+    await _storage.write(key: 'supabase_publishable_key', value: cleanKey);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('github_repo_url', repo.trim());
+    _supabaseUrl = cleanUrl;
+    _supabasePublishableKey = cleanKey;
+    _githubRepoUrl = repo.trim();
+    if (!_supabaseReady) {
+      await Supabase.initialize(
+        url: cleanUrl,
+        publishableKey: cleanKey,
+        authOptions: FlutterAuthClientOptions(
+          authFlowType: AuthFlowType.pkce,
+          localStorage: _SecureSupabaseSessionStorage(_storage),
+        ),
+      );
+      _supabaseReady = true;
+      _syncInfo = 'Supabase connected';
+    } else if (previousUrl != cleanUrl || previousKey != cleanKey) {
+      _syncInfo =
+          'Saved. Restart Forge to apply the changed Supabase project/key.';
+      throw StateError(_syncInfo);
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openAccount() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => _AccountPage(
+          projectUrl: _supabaseUrl,
+          publishableKey: _supabasePublishableKey ?? '',
+          repositoryUrl: _githubRepoUrl,
+          status: _syncInfo,
+          signedInAs: _supabaseReady
+              ? _cloud.auth.currentUser?.email ?? _cloud.auth.currentUser?.id
+              : null,
+          connected: _supabaseReady,
+          onSave: _saveCloudSettings,
+          onSignIn: _signInWithGithub,
+          onSync: _syncWorkspace,
+          onPush: _pushGithub,
+          onSignOut: () async {
+            await _cloud.auth.signOut();
+            await _storage.delete(key: 'github_access_token');
+            if (mounted) setState(() => _syncInfo = 'Signed out');
+          },
+        ),
+      ),
+    );
   }
 
   @override
@@ -1223,6 +1964,18 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
               Icons.auto_awesome_outlined,
               size: 18,
               color: _showAssistant ? lime : quiet,
+            ),
+          ),
+        if (wide)
+          IconButton(
+            tooltip: 'Account and sync',
+            onPressed: _openAccount,
+            icon: Icon(
+              Icons.account_circle_outlined,
+              size: 19,
+              color: _supabaseReady && _cloud.auth.currentUser != null
+                  ? lime
+                  : quiet,
             ),
           ),
         IconButton(
@@ -2020,6 +2773,14 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         ),
         Expanded(
           child: TextButton.icon(
+            onPressed: _openAccount,
+            icon: const Icon(Icons.account_circle_outlined, size: 17),
+            label: const Text('Account', style: TextStyle(fontSize: 11)),
+            style: TextButton.styleFrom(foregroundColor: quiet),
+          ),
+        ),
+        Expanded(
+          child: TextButton.icon(
             onPressed: _settings,
             icon: const Icon(Icons.settings_outlined, size: 17),
             label: const Text('Settings', style: TextStyle(fontSize: 11)),
@@ -2027,6 +2788,226 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
           ),
         ),
       ],
+    ),
+  );
+}
+
+class _AccountPage extends StatefulWidget {
+  const _AccountPage({
+    required this.projectUrl,
+    required this.publishableKey,
+    required this.repositoryUrl,
+    required this.status,
+    required this.signedInAs,
+    required this.connected,
+    required this.onSave,
+    required this.onSignIn,
+    required this.onSync,
+    required this.onPush,
+    required this.onSignOut,
+  });
+  final String projectUrl, publishableKey, repositoryUrl, status;
+  final String? signedInAs;
+  final bool connected;
+  final Future<void> Function(String, String, String) onSave;
+  final Future<void> Function() onSignIn, onSync, onPush, onSignOut;
+
+  @override
+  State<_AccountPage> createState() => _AccountPageState();
+}
+
+class _AccountPageState extends State<_AccountPage> {
+  late final _url = TextEditingController(text: widget.projectUrl);
+  late final _key = TextEditingController(text: widget.publishableKey);
+  late final _repo = TextEditingController(text: widget.repositoryUrl);
+  bool _busy = false;
+  late bool _connected = widget.connected;
+  late bool _signedIn = widget.signedInAs != null;
+  String _status = '';
+
+  @override
+  void dispose() {
+    _url.dispose();
+    _key.dispose();
+    _repo.dispose();
+    super.dispose();
+  }
+
+  Future<void> _run(
+    Future<void> Function() action,
+    String success, {
+    bool signedIn = false,
+    bool signedOut = false,
+    bool connected = false,
+  }) async {
+    setState(() {
+      _busy = true;
+      _status = 'Working…';
+    });
+    try {
+      await action();
+      if (mounted) {
+        setState(() {
+          _status = success;
+          if (signedIn) _signedIn = true;
+          if (signedOut) _signedIn = false;
+          if (connected) _connected = true;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _status = e.toString().replaceFirst('Exception: ', ''));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: ink,
+    appBar: AppBar(
+      backgroundColor: panel,
+      title: const Text('Account & sync'),
+      leading: IconButton(
+        onPressed: () => Navigator.pop(context),
+        icon: const Icon(Icons.arrow_back),
+      ),
+    ),
+    body: Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 540),
+        child: ListView(
+          padding: const EdgeInsets.all(24),
+          children: [
+            Container(
+              padding: const EdgeInsets.all(22),
+              decoration: BoxDecoration(
+                color: panel,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: line),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Icon(Icons.cloud_sync_outlined, color: lime, size: 38),
+                  const SizedBox(height: 15),
+                  Text(
+                    _signedIn ? 'You’re signed in' : 'Sign in to Forge',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _signedIn
+                        ? (widget.signedInAs ?? 'GitHub account connected')
+                        : 'Connect GitHub through Supabase to sync workspace files between devices and push to a repository. Your editor remains available offline.',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: quiet, height: 1.45),
+                  ),
+                  const SizedBox(height: 22),
+                  TextField(
+                    controller: _url,
+                    decoration: const InputDecoration(
+                      labelText: 'Supabase project URL',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _key,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Supabase publishable / anon key',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _repo,
+                    decoration: const InputDecoration(
+                      labelText: 'GitHub repository',
+                      hintText: 'https://github.com/owner/repository',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  OutlinedButton(
+                    onPressed: _busy
+                        ? null
+                        : () => _run(
+                            () =>
+                                widget.onSave(_url.text, _key.text, _repo.text),
+                            'Supabase settings saved',
+                            connected: true,
+                          ),
+                    child: const Text('Save connection settings'),
+                  ),
+                  const SizedBox(height: 10),
+                  if (!_signedIn)
+                    FilledButton.icon(
+                      onPressed: _busy || !_connected
+                          ? null
+                          : () => _run(
+                              widget.onSignIn,
+                              'GitHub sign-in complete',
+                              signedIn: true,
+                            ),
+                      icon: const Icon(Icons.login),
+                      label: const Text('Continue with GitHub'),
+                    )
+                  else ...[
+                    FilledButton.icon(
+                      onPressed: _busy
+                          ? null
+                          : () =>
+                                _run(widget.onSync, 'Workspace sync complete'),
+                      icon: const Icon(Icons.sync),
+                      label: const Text('Sync workspace'),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: _busy
+                          ? null
+                          : () =>
+                                _run(widget.onPush, 'Repository push complete'),
+                      icon: const Icon(Icons.cloud_upload_outlined),
+                      label: const Text('Commit & Push to GitHub'),
+                    ),
+                    TextButton(
+                      onPressed: _busy
+                          ? null
+                          : () => _run(
+                              widget.onSignOut,
+                              'Signed out',
+                              signedOut: true,
+                            ),
+                      child: const Text('Sign out'),
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+                  Text(
+                    _status.isNotEmpty ? _status : widget.status,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: quiet, fontSize: 12),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'GitHub OAuth client credentials are configured in Supabase Dashboard. Add the local callback URL to Supabase Auth redirects. The OAuth secret is never stored in Forge.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: quiet, fontSize: 10, height: 1.4),
+                  ),
+                  const SizedBox(height: 14),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Continue offline'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
     ),
   );
 }
@@ -2054,6 +3035,7 @@ class _ImplementationPlan {
   final Set<String> selectedFiles;
   bool executed = false;
   bool dismissed = false;
+  String? cloudSessionId;
   _ImplementationPlan(this.request, this.model, this.steps, this.requestedFiles)
     : selectedFiles = {...requestedFiles};
 }

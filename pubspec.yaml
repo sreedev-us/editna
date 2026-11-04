@@ -39,6 +39,9 @@ dependencies:
   file_picker: ^13.3.2
   flutter_secure_storage: ^11.2.0
   llamadart: 0.17.5
+  supabase_flutter: ^2.18.3
+  url_launcher: ^6.3.2
+  crypto: ^3.0.8
 
 dev_dependencies:
   flutter_test:
