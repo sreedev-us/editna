@@ -191,7 +191,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     final savedModel = prefs.getString('model') ?? 'auto';
     _model =
         const {
-          'nvidia/mistral-nemo-12b-instruct': 'mistralai/mistral-nemotron',
+          'nvidia/mistral-nemo-12b-instruct': 'qwen/qwen2.5-coder-32b-instruct',
+          'mistralai/mistral-nemotron': 'qwen/qwen2.5-coder-32b-instruct',
           'deepseek-ai/deepseek-r1': 'deepseek-ai/deepseek-v4-flash',
           'qwen/qwen-2.5-7b-instruct': 'meta/llama-3.2-1b-instruct',
           'meta/llama-3.1-405b-instruct': 'deepseek-ai/deepseek-v4-pro',
@@ -574,7 +575,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         const routes = {
           'HEAVY_REASONING': 'deepseek-ai/deepseek-v4-pro',
           'ALGORITHM_DEBUG': 'deepseek-ai/deepseek-v4-flash',
-          'STANDARD_EDIT': 'mistralai/mistral-nemotron',
+          'STANDARD_EDIT': 'qwen/qwen2.5-coder-32b-instruct',
           'FAST_INLINE_FIX': 'meta/llama-3.2-1b-instruct',
         };
         final model = routes[tag];
@@ -607,7 +608,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       model = 'meta/llama-3.2-1b-instruct';
     } else {
       bucket = 'STANDARD_EDIT';
-      model = 'mistralai/mistral-nemotron';
+      model = 'qwen/qwen2.5-coder-32b-instruct';
     }
     watch.stop();
     _routerInfo =
@@ -1587,8 +1588,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                         child: Text('Automatic routing'),
                       ),
                       DropdownMenuItem(
-                        value: 'mistralai/mistral-nemotron',
-                        child: Text('Mistral Nemotron'),
+                        value: 'qwen/qwen2.5-coder-32b-instruct',
+                        child: Text('Qwen 2.5 Coder 32B'),
                       ),
                       DropdownMenuItem(
                         value: 'deepseek-ai/deepseek-v4-flash',
