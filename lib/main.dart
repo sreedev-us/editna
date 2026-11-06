@@ -191,11 +191,19 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     final savedModel = prefs.getString('model') ?? 'auto';
     _model =
         const {
-          'nvidia/mistral-nemo-12b-instruct': 'qwen/qwen2.5-coder-32b-instruct',
-          'mistralai/mistral-nemotron': 'qwen/qwen2.5-coder-32b-instruct',
-          'deepseek-ai/deepseek-r1': 'deepseek-ai/deepseek-v4-flash',
-          'qwen/qwen-2.5-7b-instruct': 'meta/llama-3.2-1b-instruct',
-          'meta/llama-3.1-405b-instruct': 'deepseek-ai/deepseek-v4-pro',
+          'nvidia/mistral-nemo-12b-instruct':
+              'nvidia/nemotron-3.5-lightning-30b-a3b',
+          'mistralai/mistral-nemotron': 'nvidia/nemotron-3.5-lightning-30b-a3b',
+          'qwen/qwen2.5-coder-32b-instruct':
+              'nvidia/nemotron-3.5-lightning-30b-a3b',
+          'nv-mistralai/mistral-nemo-12b-instruct':
+              'nvidia/nemotron-3.5-lightning-30b-a3b',
+          'deepseek-ai/deepseek-v4-flash':
+              'nvidia/nemotron-3.5-lightning-30b-a3b',
+          'deepseek-ai/deepseek-v4-pro': 'nvidia/nemotron-3-ultra-550b-a55b',
+          'deepseek-ai/deepseek-r1': 'nvidia/nemotron-3.5-lightning-30b-a3b',
+          'qwen/qwen-2.5-7b-instruct': 'nvidia/nemotron-3.5-bolt-e4b',
+          'meta/llama-3.1-405b-instruct': 'nvidia/nemotron-3-ultra-550b-a55b',
         }[savedModel] ??
         savedModel;
     if (_model != savedModel) await prefs.setString('model', _model);
@@ -573,10 +581,10 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         }
         final tag = result.toString().trim().toUpperCase();
         const routes = {
-          'HEAVY_REASONING': 'deepseek-ai/deepseek-v4-pro',
-          'ALGORITHM_DEBUG': 'deepseek-ai/deepseek-v4-flash',
-          'STANDARD_EDIT': 'qwen/qwen2.5-coder-32b-instruct',
-          'FAST_INLINE_FIX': 'meta/llama-3.2-1b-instruct',
+          'HEAVY_REASONING': 'nvidia/nemotron-3-ultra-550b-a55b',
+          'ALGORITHM_DEBUG': 'nvidia/nemotron-3.5-lightning-30b-a3b',
+          'STANDARD_EDIT': 'nvidia/nemotron-3.5-lightning-30b-a3b',
+          'FAST_INLINE_FIX': 'nvidia/nemotron-3.5-bolt-e4b',
         };
         final model = routes[tag];
         if (model != null) {
@@ -595,20 +603,20 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       r'\b(prove|architecture|design a system|deep reasoning|tradeoffs)\b',
     ).hasMatch(p)) {
       bucket = 'HEAVY_REASONING';
-      model = 'deepseek-ai/deepseek-v4-pro';
+      model = 'nvidia/nemotron-3-ultra-550b-a55b';
     } else if (RegExp(
       r'\b(algorithm|complexity|optimi[sz]e|debug|crash|exception|race condition|memory leak)\b',
     ).hasMatch(p)) {
       bucket = 'ALGORITHM_DEBUG';
-      model = 'deepseek-ai/deepseek-v4-flash';
+      model = 'nvidia/nemotron-3.5-lightning-30b-a3b';
     } else if (RegExp(
       r'\b(fix typo|quick fix|inline|rename symbol|one-line)\b',
     ).hasMatch(p)) {
       bucket = 'FAST_INLINE_FIX';
-      model = 'meta/llama-3.2-1b-instruct';
+      model = 'nvidia/nemotron-3.5-bolt-e4b';
     } else {
       bucket = 'STANDARD_EDIT';
-      model = 'qwen/qwen2.5-coder-32b-instruct';
+      model = 'nvidia/nemotron-3.5-lightning-30b-a3b';
     }
     watch.stop();
     _routerInfo =
@@ -1588,20 +1596,16 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                         child: Text('Automatic routing'),
                       ),
                       DropdownMenuItem(
-                        value: 'qwen/qwen2.5-coder-32b-instruct',
-                        child: Text('Qwen 2.5 Coder 32B'),
+                        value: 'nvidia/nemotron-3.5-lightning-30b-a3b',
+                        child: Text('Nemotron 3.5 Lightning 30B'),
                       ),
                       DropdownMenuItem(
-                        value: 'deepseek-ai/deepseek-v4-flash',
-                        child: Text('DeepSeek V4 Flash'),
+                        value: 'nvidia/nemotron-3.5-bolt-e4b',
+                        child: Text('Nemotron 3.5 Bolt E4B'),
                       ),
                       DropdownMenuItem(
-                        value: 'meta/llama-3.2-1b-instruct',
-                        child: Text('Llama 3.2 1B'),
-                      ),
-                      DropdownMenuItem(
-                        value: 'deepseek-ai/deepseek-v4-pro',
-                        child: Text('DeepSeek V4 Pro'),
+                        value: 'nvidia/nemotron-3-ultra-550b-a55b',
+                        child: Text('Nemotron 3 Ultra 550B'),
                       ),
                     ],
                     onChanged: (v) => setLocal(() => selected = v ?? 'auto'),
