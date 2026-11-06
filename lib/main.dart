@@ -1057,6 +1057,86 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     caseSensitive: false,
   ).hasMatch(text.trim());
 
+  bool _isProjectEditRequest(String text) => RegExp(
+    r'\b(create|add|make|implement|build|write|update|edit|refactor|fix|change|remove|delete|rename|generate|modify)\b',
+    caseSensitive: false,
+  ).hasMatch(text);
+
+  Future<void> _answerProjectQuestion(String text) async {
+    final route = await _route(text);
+    final user = _ChatMessage(text, true, route);
+    setState(() {
+      _messages.add(user);
+      _busyLabel = 'Reading project context and answering…';
+    });
+    _scrollChat();
+    try {
+      if (_apiKey == null || _apiKey!.trim().isEmpty) {
+        final answer = await _localConversation(text);
+        if (answer == null) {
+          throw Exception(
+            'Add your NVIDIA API key in Settings, or install a local Qwen model to chat offline.',
+          );
+        }
+        if (!mounted) return;
+        setState(
+          () => _messages.add(_ChatMessage(answer, false, 'on-device Qwen')),
+        );
+        return;
+      }
+      String? activeContent;
+      if (_activeFile != null && _files.contains(_activeFile)) {
+        activeContent = await _file(_activeFile!).readAsString();
+        if (activeContent.length > 16000) {
+          activeContent = activeContent.substring(0, 16000);
+        }
+      }
+      final context = <String, Object?>{
+        'question': text,
+        'active_file': _activeFile,
+        if (activeContent != null) 'active_file_content': activeContent,
+        'project_files': _files.take(100).toList(),
+        'project_folders': _folders.take(100).toList(),
+      };
+      final answer = StringBuffer();
+      await _complete(
+        [
+          {
+            'role': 'system',
+            'content':
+                'You are Forge, a practical coding assistant inside the user’s editor. Answer questions directly and conversationally. Use supplied project context when relevant. Do not make an implementation plan or output JSON unless asked. Never claim you changed files; file edits are performed only through the reviewed Apply changes flow.',
+          },
+          {'role': 'user', 'content': jsonEncode(context)},
+        ],
+        route,
+        answer.write,
+        maxTokens: 2048,
+      );
+      if (!mounted) return;
+      setState(
+        () =>
+            _messages.add(_ChatMessage(answer.toString().trim(), false, route)),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _messages.add(
+          _ChatMessage(
+            e.toString().replaceFirst('Exception: ', ''),
+            false,
+            route,
+            error: true,
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+        _scrollChat();
+      }
+    }
+  }
+
   String _fallbackConversation(String text) {
     final normalized = text.toLowerCase().replaceAll(RegExp(r'[!.? ]+$'), '');
     if (normalized.startsWith('thank') || normalized == 'thx') {
@@ -1583,7 +1663,13 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
             finishReason = choice['finish_reason'] as String? ?? finishReason;
             final delta = choice['delta'] as Map?;
             final message = choice['message'] as Map?;
-            final token = delta?['content'] ?? message?['content'];
+            final token =
+                delta?['content'] ??
+                message?['content'] ??
+                (responseFormat == null
+                    ? (delta?['reasoning_content'] ??
+                          message?['reasoning_content'])
+                    : null);
             if (token is String && token.isNotEmpty) {
               receivedAnswerText = true;
               onToken(token);
@@ -1710,6 +1796,10 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       }
       return;
     }
+    if (!_isProjectEditRequest(text)) {
+      await _answerProjectQuestion(text);
+      return;
+    }
     if (_workspace == null) {
       setState(() {
         _busy = false;
@@ -1803,6 +1893,10 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
           ),
         ),
       );
+      // Run the edit pass as soon as the plan is ready. The user still reviews
+      // the proposed files and explicitly applies them before anything is written.
+      setState(() => _busy = false);
+      await _executePlan(plan);
     } catch (e) {
       if (!mounted) return;
       final error = e.toString().replaceFirst('Exception: ', '');
